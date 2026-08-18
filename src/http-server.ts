@@ -384,15 +384,18 @@ function createMcpServer(): McpServer {
         const resolved = await resolvePath(basePath || ".");
         const skipDirs = new Set([".git", "node_modules", ".next", "dist", "__pycache__", ".cache"]);
         const files: string[] = [];
+        const hasGlobstar = pattern.includes("**");
 
         // Convert glob pattern to regex
+        // Use __GS__ placeholder to avoid conflict with {} brace expansion
         const regexStr = pattern
           .replace(/\./g, "\\.")
-          .replace(/\*\*/g, "{{GLOBSTAR}}")
+          .replace(/\*\*\//g, "__GS__")          // **/ first (includes slash)
+          .replace(/\*\*/g, "__GS__")            // ** at end
           .replace(/\*/g, "[^/]*")
           .replace(/\?/g, "[^/]")
           .replace(/\{([^}]+)\}/g, (_, opts) => `(${opts.split(",").join("|")})`)
-          .replace(/\{\{GLOBSTAR\}\}/g, ".*");
+          .replace(/__GS__/g, "(?:.+/)?");
         const regex = new RegExp(`^${regexStr}$`);
 
         async function findInDir(dir: string) {
@@ -404,10 +407,14 @@ function createMcpServer(): McpServer {
             if (item.isDirectory()) {
               if (skipDirs.has(item.name)) continue;
               await findInDir(path.join(dir, item.name));
-            } else if (regex.test(item.name)) {
+            } else {
               const full = path.join(dir, item.name);
               const rel = path.relative(resolved, full).replace(/\\/g, "/");
-              files.push(rel);
+              // Test against relative path for ** patterns, filename for simple patterns
+              const testStr = hasGlobstar ? rel : item.name;
+              if (regex.test(testStr)) {
+                files.push(rel);
+              }
             }
           }
         }
