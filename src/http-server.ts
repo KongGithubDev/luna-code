@@ -27,7 +27,22 @@ const GIT_EXE = process.platform === "win32" ? "git" : "git";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+function isAbsolute(p: string): boolean {
+  // Windows: C:\, C:/, D:\, D:/, etc.
+  if (/^[a-zA-Z]:[\\/]/.test(p)) return true;
+  // Unix/Mac: /home/...
+  if (p.startsWith("/")) return true;
+  // UNC: \\server\share
+  if (p.startsWith("\\\\")) return true;
+  return false;
+}
+
 async function resolvePath(p: string): Promise<string> {
+  // If absolute path, use it directly (no sandbox check)
+  if (isAbsolute(p)) {
+    return path.resolve(p);
+  }
+  // Relative path: resolve against WORK_DIR, check traversal
   const resolved = path.resolve(WORK_DIR, p);
   if (!resolved.startsWith(WORK_DIR)) {
     throw new Error(`Path escapes working directory: ${p}`);
@@ -94,7 +109,7 @@ function createMcpServer(): McpServer {
     "read_file",
     "Read the contents of a file. Returns the full text. Use offset/limit for partial reads.",
     {
-      path: z.string().describe("File path relative to working directory"),
+      path: z.string().describe("File path (relative or absolute)"),
       offset: z.number().optional().describe("Line number to start reading from (1-indexed)"),
       limit: z.number().optional().describe("Maximum number of lines to read"),
     },
@@ -123,7 +138,7 @@ function createMcpServer(): McpServer {
     "write_file",
     "Create or overwrite a file. Parent directories are created automatically.",
     {
-      path: z.string().describe("File path relative to working directory"),
+      path: z.string().describe("File path (relative or absolute)"),
       content: z.string().describe("Content to write"),
     },
     async ({ path: filePath, content }) => {
@@ -144,7 +159,7 @@ function createMcpServer(): McpServer {
     "edit_file",
     "Replace an exact string in a file. The old_string must match exactly including whitespace and indentation.",
     {
-      path: z.string().describe("File path relative to working directory"),
+      path: z.string().describe("File path (relative or absolute)"),
       old_string: z.string().describe("Exact string to find and replace (must be unique in the file)"),
       new_string: z.string().describe("Replacement string"),
     },
@@ -196,7 +211,7 @@ function createMcpServer(): McpServer {
     "delete_file",
     "Delete a file or empty directory.",
     {
-      path: z.string().describe("Path relative to working directory"),
+      path: z.string().describe("Path (relative or absolute)"),
     },
     async ({ path: filePath }) => {
       try {
@@ -239,7 +254,7 @@ function createMcpServer(): McpServer {
     "list_directory",
     "List files and subdirectories. Returns a sorted listing.",
     {
-      path: z.string().optional().describe("Directory path (default: working directory)"),
+      path: z.string().optional().describe("Directory path (absolute or relative, default: working directory)"),
       recursive: z.boolean().optional().describe("List recursively (skips .git and node_modules)"),
     },
     async ({ path: dirPath, recursive }) => {
@@ -280,7 +295,7 @@ function createMcpServer(): McpServer {
     "get_file_info",
     "Get metadata about a file or directory: type, size, dates, permissions.",
     {
-      path: z.string().describe("Path relative to working directory"),
+      path: z.string().describe("Path (relative or absolute)"),
     },
     async ({ path: filePath }) => {
       try {
@@ -299,16 +314,14 @@ function createMcpServer(): McpServer {
         return { content: [{ type: "text" as const, text: `Error: ${err.message}` }], isError: true };
       }
     }
-  );
-
-  // ── Search (grep) ───────────────────────────────────────────────────────
+  );  // ── Search (grep) ───────────────────────────────────────────────────────
 
   server.tool(
     "search_files",
     "Search for a regex or literal pattern across files. Returns matching lines with file paths and line numbers.",
     {
       pattern: z.string().describe("Search pattern (regex supported)"),
-      path: z.string().optional().describe("Directory or file to search in (default: working directory)"),
+      path: z.string().optional().describe("Directory or file to search in (absolute or relative, default: working directory)"),
       file_type: z.string().optional().describe("Restrict to file extension, e.g. ts, py, js"),
       case_insensitive: z.boolean().optional().describe("Case-insensitive matching"),
       max_results: z.number().optional().describe("Max results to return (default: 50)"),
@@ -317,30 +330,42 @@ function createMcpServer(): McpServer {
       try {
         const resolved = await resolvePath(searchPath || ".");
         const limit = max_results || 50;
-        const args: string[] = ["-rn", "--max-count=" + limit.toString()];
-        if (case_insensitive) args.push("-i");
-        if (file_type) args.push(`--include=*.${file_type}`);
-        args.push("--", pattern.replace(/'/g, "'\\''"), resolved.replace(/'/g, "'\\''"));
+        const regex = new RegExp(pattern, case_insensitive ? "i" : "");
+        const skipDirs = new Set([".git", "node_modules", ".next", "dist", "__pycache__", ".cache"]);
+        const results: string[] = [];
 
-        // Try ripgrep first, fall back to grep
-        let stdout = "";
-        const rgResult = await run(`rg ${args.join(" ")}`);
-        if (rgResult.stdout) {
-          stdout = rgResult.stdout;
-        } else {
-          const grepArgs = ["-rn"];
-          if (case_insensitive) grepArgs.push("-i");
-          if (file_type) grepArgs.push(`--include=*.${file_type}`);
-          grepArgs.push("-m", limit.toString(), pattern.replace(/'/g, "'\\''"), resolved.replace(/'/g, "'\\''"));
-          const grepResult = await run(`grep ${grepArgs.join(" ")}`);
-          stdout = grepResult.stdout;
+        async function searchDir(dir: string) {
+          if (results.length >= limit) return;
+          let items;
+          try { items = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+          for (const item of items) {
+            if (results.length >= limit) return;
+            if (item.isDirectory()) {
+              if (skipDirs.has(item.name)) continue;
+              await searchDir(path.join(dir, item.name));
+            } else {
+              if (file_type && !item.name.endsWith(`.${file_type}`)) continue;
+              const filePath = path.join(dir, item.name);
+              try {
+                const content = await fs.readFile(filePath, "utf-8");
+                const fileLines = content.split("\n");
+                for (let i = 0; i < fileLines.length; i++) {
+                  if (results.length >= limit) break;
+                  if (regex.test(fileLines[i])) {
+                    const relPath = path.relative(WORK_DIR, filePath).replace(/\\/g, "/");
+                    results.push(`${relPath}:${i + 1}: ${fileLines[i].trim()}`);
+                  }
+                }
+              } catch {}
+            }
+          }
         }
 
-        const lines = stdout.trim().split("\n").filter(Boolean);
-        const truncated = lines.length >= limit ? `\n... (showing ${limit} results, use max_results for more)` : "";
-        return { content: [{ type: "text" as const, text: lines.join("\n") + truncated || "No matches found." }] };
+        await searchDir(resolved);
+        const truncated = results.length >= limit ? `\n... (showing ${limit} results, use max_results for more)` : "";
+        return { content: [{ type: "text" as const, text: results.join("\n") + truncated || "No matches found." }] };
       } catch (err: any) {
-        return { content: [{ type: "text" as const, text: err.stdout || `Error: ${err.message}` }], isError: !err.stdout };
+        return { content: [{ type: "text" as const, text: `Error: ${err.message}` }], isError: true };
       }
     }
   );
@@ -352,15 +377,43 @@ function createMcpServer(): McpServer {
     "Find files by name pattern. Use ** for recursive, * for wildcard. Example: **/*.ts",
     {
       pattern: z.string().describe("Glob pattern, e.g. **/*.ts, src/**/*.test.js, *.json"),
-      path: z.string().optional().describe("Base directory (default: working directory)"),
+      path: z.string().optional().describe("Base directory (absolute or relative, default: working directory)"),
     },
     async ({ pattern, path: basePath }) => {
       try {
         const resolved = await resolvePath(basePath || ".");
-        const cmd = `find '${resolved.replace(/'/g, "'\\''")}' -name '${pattern.replace(/'/g, "'\\''")}' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.next/*' | head -100`;
-        const { stdout } = await run(cmd);
-        const lines = stdout.trim().split("\n").filter(Boolean).map((l) => path.relative(resolved, l).replace(/\\/g, "/"));
-        return { content: [{ type: "text" as const, text: lines.join("\n") || "No files found." }] };
+        const skipDirs = new Set([".git", "node_modules", ".next", "dist", "__pycache__", ".cache"]);
+        const files: string[] = [];
+
+        // Convert glob pattern to regex
+        const regexStr = pattern
+          .replace(/\./g, "\\.")
+          .replace(/\*\*/g, "{{GLOBSTAR}}")
+          .replace(/\*/g, "[^/]*")
+          .replace(/\?/g, "[^/]")
+          .replace(/\{([^}]+)\}/g, (_, opts) => `(${opts.split(",").join("|")})`)
+          .replace(/\{\{GLOBSTAR\}\}/g, ".*");
+        const regex = new RegExp(`^${regexStr}$`);
+
+        async function findInDir(dir: string) {
+          if (files.length >= 100) return;
+          let items;
+          try { items = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+          for (const item of items) {
+            if (files.length >= 100) return;
+            if (item.isDirectory()) {
+              if (skipDirs.has(item.name)) continue;
+              await findInDir(path.join(dir, item.name));
+            } else if (regex.test(item.name)) {
+              const full = path.join(dir, item.name);
+              const rel = path.relative(resolved, full).replace(/\\/g, "/");
+              files.push(rel);
+            }
+          }
+        }
+
+        await findInDir(resolved);
+        return { content: [{ type: "text" as const, text: files.join("\n") || "No files found." }] };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `Error: ${err.message}` }], isError: true };
       }
@@ -374,12 +427,15 @@ function createMcpServer(): McpServer {
     "Execute a shell command. Returns stdout and stderr. Use for build, test, npm, git, etc.",
     {
       command: z.string().describe("Shell command to execute"),
-      cwd: z.string().optional().describe("Working directory (default: server working directory)"),
+      cwd: z.string().optional().describe("Working directory (absolute or relative, default: server working directory)"),
       timeout: z.number().optional().describe("Timeout in seconds (default: 30)"),
     },
     async ({ command, cwd, timeout }) => {
       try {
-        const workingDir = cwd ? await resolvePath(cwd) : WORK_DIR;
+        let workingDir = WORK_DIR;
+        if (cwd) {
+          workingDir = isAbsolute(cwd) ? path.resolve(cwd) : await resolvePath(cwd);
+        }
         const timeoutMs = (timeout || 30) * 1000;
 
         const blocked = ["rm -rf /", "mkfs", ":(){ :|:& };:"];
