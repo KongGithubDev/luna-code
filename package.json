@@ -1,0 +1,23 @@
+{
+  "name": "luna-code",
+  "version": "1.0.0",
+  "description": "Local coding assistant for ChatGPT Luna via MCP",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/http-server.js",
+    "start:stdio": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "dotenv": "^16.4.7",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  },
+  "keywords": ["mcp", "chatgpt", "luna", "coding"],
+  "license": "MIT"
+}
